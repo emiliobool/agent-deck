@@ -1,0 +1,143 @@
+package session
+
+import (
+	"path/filepath"
+	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
+)
+
+// DiscoverExistingTmuxSessions finds all tmux sessions and converts them to instances
+func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, error) {
+	// Get all tmux sessions
+	tmuxSessions, err := tmux.DiscoverAllTmuxSessions()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a map of existing sessions by tmux name
+	existingMap := make(map[string]bool)
+	for _, inst := range existingInstances {
+		if inst.GetTmuxSession() != nil {
+			existingMap[inst.GetTmuxSession().Name] = true
+		}
+		// Also track by title
+		existingMap[inst.Title] = true
+	}
+
+	var discovered []*Instance
+	for _, sess := range tmuxSessions {
+		// Skip if already tracked
+		if existingMap[sess.Name] || existingMap[sess.DisplayName] {
+			continue
+		}
+
+		// Skip agent-deck sessions (they should already be tracked)
+		if strings.HasPrefix(sess.Name, tmux.SessionPrefix) {
+			continue
+		}
+
+		// Create instance for discovered session
+		title := sess.DisplayName
+		projectPath := sess.WorkDir
+		if projectPath == "" {
+			projectPath = "~"
+		}
+
+		// Enable mouse mode for proper scrolling in imported sessions
+		sess.EnableMouseMode()
+
+		inst := &Instance{
+			ID:          generateID(),
+			Title:       title,
+			ProjectPath: projectPath,
+			Status:      StatusIdle,
+			Tool:        detectToolFromName(title),
+			tmuxSession: sess,
+		}
+		inst.UpdateStatus()
+		discovered = append(discovered, inst)
+	}
+
+	return discovered, nil
+}
+
+// GroupByProject groups sessions by their parent project directory
+func GroupByProject(instances []*Instance) map[string][]*Instance {
+	groups := make(map[string][]*Instance)
+
+	for _, inst := range instances {
+		// Extract parent directory name
+		projectName := extractProjectName(inst.ProjectPath)
+		groups[projectName] = append(groups[projectName], inst)
+	}
+
+	return groups
+}
+
+// FilterByQuery filters sessions by title, project path, or tool
+func FilterByQuery(instances []*Instance, query string) []*Instance {
+	if query == "" {
+		return instances
+	}
+
+	query = strings.ToLower(query)
+	filtered := make([]*Instance, 0)
+
+	for _, inst := range instances {
+		if strings.Contains(strings.ToLower(inst.Title), query) ||
+			strings.Contains(strings.ToLower(inst.ProjectPath), query) ||
+			strings.Contains(strings.ToLower(inst.Tool), query) {
+			filtered = append(filtered, inst)
+		}
+	}
+
+	return filtered
+}
+
+// detectToolFromName tries to detect tool type from session name
+func detectToolFromName(name string) string {
+	nameLower := strings.ToLower(name)
+
+	if strings.Contains(nameLower, "claude") {
+		return "claude"
+	}
+	if strings.Contains(nameLower, "gemini") {
+		return "gemini"
+	}
+	if strings.Contains(nameLower, "aider") {
+		return "aider"
+	}
+	if strings.Contains(nameLower, "codex") {
+		return "codex"
+	}
+
+	return "shell"
+}
+
+// extractProjectName extracts the parent directory name from a path
+func extractProjectName(projectPath string) string {
+	// Clean the path and split into parts
+	cleanPath := filepath.Clean(projectPath)
+	parts := strings.Split(cleanPath, string(filepath.Separator))
+
+	// Filter out empty parts
+	var filteredParts []string
+	for _, part := range parts {
+		if part != "" {
+			filteredParts = append(filteredParts, part)
+		}
+	}
+
+	// For /home/user/projects/devops, we want "projects" (second-to-last)
+	if len(filteredParts) >= 2 {
+		return filteredParts[len(filteredParts)-2]
+	}
+
+	// Fallback to the last part
+	if len(filteredParts) > 0 {
+		return filteredParts[len(filteredParts)-1]
+	}
+
+	return "unknown"
+}

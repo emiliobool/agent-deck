@@ -1,0 +1,243 @@
+package ui
+
+import (
+	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+var (
+	searchBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62")).
+			Padding(0, 1)
+
+	resultItemStyle = lipgloss.NewStyle().
+			Padding(0, 2)
+
+	selectedResultStyle = lipgloss.NewStyle().
+				Padding(0, 2).
+				Background(lipgloss.Color("62")).
+				Foreground(lipgloss.Color("230"))
+
+	overlayStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62")).
+			Padding(1, 2)
+)
+
+// Search represents the search overlay component
+type Search struct {
+	input      textinput.Model
+	results    []*session.Instance
+	cursor     int
+	width      int
+	height     int
+	visible    bool
+	allItems   []*session.Instance
+}
+
+// NewSearch creates a new search overlay
+func NewSearch() *Search {
+	ti := textinput.New()
+	ti.Placeholder = "Search sessions..."
+	ti.Focus()
+	ti.CharLimit = 100
+	ti.Width = 50
+
+	return &Search{
+		input:   ti,
+		results: []*session.Instance{},
+		cursor:  0,
+		visible: false,
+	}
+}
+
+// SetItems sets the full list of items to search through
+func (s *Search) SetItems(items []*session.Instance) {
+	s.allItems = items
+	s.updateResults()
+}
+
+// SetSize sets the dimensions of the search overlay
+func (s *Search) SetSize(width, height int) {
+	s.width = width
+	s.height = height
+}
+
+// Show makes the search overlay visible
+func (s *Search) Show() {
+	s.visible = true
+	s.input.Focus()
+}
+
+// Hide hides the search overlay
+func (s *Search) Hide() {
+	s.visible = false
+	s.input.Blur()
+}
+
+// IsVisible returns whether the search overlay is visible
+func (s *Search) IsVisible() bool {
+	return s.visible
+}
+
+// Selected returns the currently selected item
+func (s *Search) Selected() *session.Instance {
+	if len(s.results) == 0 {
+		return nil
+	}
+	if s.cursor >= len(s.results) {
+		s.cursor = len(s.results) - 1
+	}
+	return s.results[s.cursor]
+}
+
+// Update handles messages for the search overlay
+func (s *Search) Update(msg tea.Msg) tea.Cmd {
+	if !s.visible {
+		return nil
+	}
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc":
+			s.Hide()
+			return nil
+
+		case "enter":
+			if len(s.results) > 0 {
+				s.Hide()
+				// Parent should handle the selection
+			}
+			return nil
+
+		case "up", "ctrl+k":
+			if s.cursor > 0 {
+				s.cursor--
+			}
+			return nil
+
+		case "down", "ctrl+j":
+			if s.cursor < len(s.results)-1 {
+				s.cursor++
+			}
+			return nil
+
+		default:
+			// Update text input
+			var cmd tea.Cmd
+			s.input, cmd = s.input.Update(msg)
+			s.updateResults()
+			return cmd
+		}
+	}
+
+	return nil
+}
+
+// updateResults filters the items based on the current input
+func (s *Search) updateResults() {
+	query := s.input.Value()
+	s.results = session.FilterByQuery(s.allItems, query)
+	s.cursor = 0
+}
+
+// View renders the search overlay
+func (s *Search) View() string {
+	if !s.visible {
+		return ""
+	}
+
+	// Build search input box
+	searchBox := searchBoxStyle.Render(s.input.View())
+
+	// Build results list
+	var resultsStr strings.Builder
+	maxResults := 10
+	if len(s.results) > maxResults {
+		s.results = s.results[:maxResults]
+	}
+
+	for i, item := range s.results {
+		var line string
+		if i == s.cursor {
+			line = selectedResultStyle.Render("› " + item.Title + " (" + item.Tool + ")")
+		} else {
+			line = resultItemStyle.Render("  " + item.Title + " (" + item.Tool + ")")
+		}
+		resultsStr.WriteString(line)
+		if i < len(s.results)-1 {
+			resultsStr.WriteString("\n")
+		}
+	}
+
+	// Show count
+	countStr := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241")).
+		Render("  " + formatCount(len(s.results)))
+
+	// Combine everything
+	content := searchBox + "\n\n" + resultsStr.String() + "\n" + countStr
+
+	// Wrap in overlay box
+	overlay := overlayStyle.Width(60).Render(content)
+
+	// Center in the screen
+	return centerInScreen(overlay, s.width, s.height)
+}
+
+// formatCount formats the result count
+func formatCount(count int) string {
+	if count == 0 {
+		return "No results"
+	}
+	if count == 1 {
+		return "1 result"
+	}
+	return lipgloss.NewStyle().Render(
+		lipgloss.NewStyle().Bold(true).Render(string(rune('0'+count))) + " results",
+	)
+}
+
+// centerInScreen centers content in the terminal
+func centerInScreen(content string, screenWidth, screenHeight int) string {
+	lines := strings.Split(content, "\n")
+	contentHeight := len(lines)
+	contentWidth := 0
+	for _, line := range lines {
+		if len(line) > contentWidth {
+			contentWidth = len(line)
+		}
+	}
+
+	// Calculate vertical padding
+	verticalPad := (screenHeight - contentHeight) / 2
+	if verticalPad < 0 {
+		verticalPad = 0
+	}
+
+	// Calculate horizontal padding
+	horizontalPad := (screenWidth - contentWidth) / 2
+	if horizontalPad < 0 {
+		horizontalPad = 0
+	}
+
+	// Add vertical padding
+	var result strings.Builder
+	for i := 0; i < verticalPad; i++ {
+		result.WriteString("\n")
+	}
+
+	// Add horizontal padding and content
+	padding := strings.Repeat(" ", horizontalPad)
+	for _, line := range lines {
+		result.WriteString(padding + line + "\n")
+	}
+
+	return result.String()
+}
