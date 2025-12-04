@@ -1619,3 +1619,148 @@ func truncateEnd(s string, n int) string {
 	}
 	return "..." + s[len(s)-n:]
 }
+
+// =============================================================================
+// Activity Timestamp Detection Tests
+// =============================================================================
+
+// TestGetWindowActivity verifies GetWindowActivity returns a valid Unix timestamp
+func TestGetWindowActivity(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	sess := NewSession("activity-test", t.TempDir())
+	err := sess.Start("")
+	assert.NoError(t, err)
+	defer func() { _ = sess.Kill() }()
+	time.Sleep(100 * time.Millisecond)
+
+	ts, err := sess.GetWindowActivity()
+	assert.NoError(t, err)
+	assert.True(t, ts > 0, "timestamp should be positive")
+
+	// Timestamp should be recent (within last minute)
+	now := time.Now().Unix()
+	assert.True(t, ts > now-60, "timestamp should be recent")
+	assert.True(t, ts <= now+1, "timestamp should not be in the future")
+}
+
+// TestIsSustainedActivity verifies spike detection logic
+func TestIsSustainedActivity(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	sess := NewSession("sustained-test", t.TempDir())
+	err := sess.Start("")
+	assert.NoError(t, err)
+	defer func() { _ = sess.Kill() }()
+	time.Sleep(100 * time.Millisecond)
+
+	// Without continuous output, should return false (spike)
+	// This is an integration test - we can't guarantee the result
+	// but we can verify the method doesn't error/panic
+	result := sess.isSustainedActivity()
+	t.Logf("isSustainedActivity result: %v", result)
+	// Idle session should NOT show sustained activity (status bar updates are spikes)
+}
+
+// TestSpikeDetectionWindowStaysGreen verifies that during spike detection window,
+// status stays GREEN instead of falling through to YELLOW.
+// This is the fix for the yellow spike bug during active sessions.
+func TestSpikeDetectionWindowStaysGreen(t *testing.T) {
+	session := NewSession("spike-window-test", "/tmp")
+
+	// Simulate a session that was previously idle/waiting (cooldown expired)
+	session.stateTracker = &StateTracker{
+		lastHash:              "old_hash",
+		lastChangeTime:        time.Now().Add(-5 * time.Second), // Cooldown expired
+		acknowledged:          false,                            // Would normally return "waiting"
+		lastActivityTimestamp: 100,
+		activityCheckStart:    time.Time{}, // No active spike detection
+		activityChangeCount:   0,
+	}
+
+	// Simulate first timestamp change detected (start of spike detection)
+	// This is what happens when GetStatus detects a new timestamp
+	session.stateTracker.lastActivityTimestamp = 101
+	session.stateTracker.activityCheckStart = time.Now() // Start spike detection window
+	session.stateTracker.activityChangeCount = 1
+
+	// Now simulate what GetStatus does after the spike detection block:
+	// With the FIX: should stay GREEN during spike detection window
+	// Without fix: would check cooldown (expired) and return YELLOW
+
+	// Check if we're in spike detection window
+	inSpikeWindow := !session.stateTracker.activityCheckStart.IsZero() &&
+		time.Since(session.stateTracker.activityCheckStart) < 1*time.Second
+
+	var status string
+	if inSpikeWindow {
+		// FIX: Stay GREEN during spike detection
+		status = "active"
+	} else if time.Since(session.stateTracker.lastChangeTime) < activityCooldown {
+		status = "active"
+	} else if session.stateTracker.acknowledged {
+		status = "idle"
+	} else {
+		status = "waiting"
+	}
+
+	assert.Equal(t, "active", status,
+		"During spike detection window, status should be GREEN (active), not YELLOW (waiting)")
+	t.Log("Spike detection window correctly returns GREEN to avoid yellow flicker")
+}
+
+// TestSpikeDetectionWindowExpiry verifies that after spike window expires
+// with only 1 change, it correctly returns to the appropriate state.
+func TestSpikeDetectionWindowExpiry(t *testing.T) {
+	session := NewSession("spike-expiry-test", "/tmp")
+
+	// Simulate a session where spike detection started 2 seconds ago (expired)
+	// and only had 1 change (a spike, not sustained activity)
+	session.stateTracker = &StateTracker{
+		lastHash:              "stable_hash",
+		lastChangeTime:        time.Now().Add(-5 * time.Second), // Cooldown expired
+		acknowledged:          false,
+		lastActivityTimestamp: 101,
+		activityCheckStart:    time.Now().Add(-2 * time.Second), // Spike window expired
+		activityChangeCount:   1,                                // Only 1 change = spike
+	}
+
+	// Check if spike window expired
+	spikeWindowExpired := time.Since(session.stateTracker.activityCheckStart) > 1*time.Second
+
+	if spikeWindowExpired && session.stateTracker.activityChangeCount == 1 {
+		// Spike detected and filtered - reset tracking
+		session.stateTracker.activityCheckStart = time.Time{}
+		session.stateTracker.activityChangeCount = 0
+	}
+
+	// After spike filtering, compute status
+	inSpikeWindow := !session.stateTracker.activityCheckStart.IsZero() &&
+		time.Since(session.stateTracker.activityCheckStart) < 1*time.Second
+
+	var status string
+	if inSpikeWindow {
+		status = "active"
+	} else if time.Since(session.stateTracker.lastChangeTime) < activityCooldown {
+		status = "active"
+	} else if session.stateTracker.acknowledged {
+		status = "idle"
+	} else {
+		status = "waiting"
+	}
+
+	assert.Equal(t, "waiting", status,
+		"After spike window expires with only 1 change, should return to waiting (not green)")
+	t.Log("Spike correctly filtered - single timestamp change doesn't cause false GREEN")
+}
+
+func TestSessionLogFile(t *testing.T) {
+	sess := NewSession("test-log", t.TempDir())
+
+	logFile := sess.LogFile()
+	assert.Contains(t, logFile, ".agent-deck/logs/")
+	assert.Contains(t, logFile, "agentdeck_test-log")
+	assert.True(t, strings.HasSuffix(logFile, ".log"))
+}

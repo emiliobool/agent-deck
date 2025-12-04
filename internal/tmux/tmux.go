@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -218,9 +219,14 @@ var toolDetectionPatterns = map[string][]*regexp.Regexp{
 //	YELLOW (waiting) = Content stable, user hasn't seen it
 //	GRAY (idle)      = Content stable, user has seen it
 type StateTracker struct {
-	lastHash       string    // SHA256 of normalized content
-	lastChangeTime time.Time // When content last changed
-	acknowledged   bool      // User has seen this state (yellow vs gray)
+	lastHash              string    // SHA256 of normalized content (for fallback)
+	lastChangeTime        time.Time // When sustained activity was last confirmed
+	acknowledged          bool      // User has seen this state (yellow vs gray)
+	lastActivityTimestamp int64     // tmux window_activity timestamp for spike detection
+
+	// Non-blocking spike detection: track changes across tick cycles
+	activityCheckStart time.Time // When we started tracking for sustained activity
+	activityChangeCount int      // How many timestamp changes seen in current window
 }
 
 // activityCooldown is how long to show GREEN after content stops changing.
@@ -269,6 +275,26 @@ func (s *Session) ensureStateTrackerLocked() {
 			acknowledged:   false,
 		}
 	}
+}
+
+// LogFile returns the path to this session's pipe-pane log file
+// Logs are stored in ~/.agent-deck/logs/<session-name>.log
+func (s *Session) LogFile() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "/tmp"
+	}
+	logDir := filepath.Join(homeDir, ".agent-deck", "logs")
+	return filepath.Join(logDir, s.Name+".log")
+}
+
+// LogDir returns the directory containing all session logs
+func LogDir() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "/tmp"
+	}
+	return filepath.Join(homeDir, ".agent-deck", "logs")
 }
 
 // NewSession creates a new Session instance with a unique name
@@ -519,6 +545,22 @@ func (s *Session) Kill() error {
 	return cmd.Run()
 }
 
+// GetWindowActivity returns Unix timestamp of last tmux window activity
+// This is a fast operation (~4ms) that checks when the window last had output
+func (s *Session) GetWindowActivity() (int64, error) {
+	cmd := exec.Command("tmux", "display-message", "-t", s.Name, "-p", "#{window_activity}")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get window activity: %w", err)
+	}
+	var ts int64
+	_, err = fmt.Sscanf(strings.TrimSpace(string(output)), "%d", &ts)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse timestamp: %w", err)
+	}
+	return ts, nil
+}
+
 // CapturePane captures the visible pane content
 func (s *Session) CapturePane() (string, error) {
 	// -J joins wrapped lines and trims trailing spaces so hashes don't change on resize
@@ -703,137 +745,249 @@ func (s *Session) AcknowledgeWithSnapshot() {
 
 // GetStatus returns the current status of the session
 //
-// Time-based 3-state model to prevent flickering:
+// Activity-based 3-state model with spike filtering:
 //
-//	GREEN (active)   = Content changed within activityCooldown (2 seconds)
-//	YELLOW (waiting) = Cooldown expired + NOT acknowledged (needs attention)
-//	GRAY (idle)      = Cooldown expired + acknowledged (user has seen it)
+//	GREEN (active)   = Sustained activity (2+ changes in 1s) within cooldown
+//	YELLOW (waiting) = Cooldown expired, NOT acknowledged (needs attention)
+//	GRAY (idle)      = Cooldown expired, acknowledged (user has seen it)
 //
-// Key insight: AI agents output in bursts with micro-pauses. A time-based
-// cooldown prevents flickering during these natural pauses - we stay GREEN
-// for 2 seconds after ANY content change, regardless of micro-pauses.
+// Key insight: Status bar updates cause single timestamp changes (spikes).
+// Real AI work causes multiple timestamp changes over 1 second (sustained).
+// This filters spikes to prevent false GREEN flashes.
 //
 // Logic:
-// 1. Capture content and hash it
-// 2. If hash changed → update lastChangeTime, return GREEN
-// 3. If hash same → check if cooldown expired
-//   - If within cooldown → GREEN (still considered active)
-//   - If cooldown expired → YELLOW or GRAY based on acknowledged
+// 1. Check busy indicator (immediate GREEN if present)
+// 2. Get activity timestamp (fast ~4ms)
+// 3. If timestamp changed → check if sustained or spike
+//   - Sustained (1+ more changes in 1s) → GREEN
+//   - Spike (no more changes) → filtered (no state change)
+// 4. Check cooldown → GREEN if within
+// 5. Cooldown expired → YELLOW or GRAY based on acknowledged
 func (s *Session) GetStatus() (string, error) {
 	shortName := s.DisplayName
 	if len(shortName) > 12 {
 		shortName = shortName[:12]
 	}
 
-	// Perform expensive operations before acquiring lock
 	if !s.Exists() {
 		s.mu.Lock()
 		s.lastStableStatus = "inactive"
 		s.mu.Unlock()
-		debugLog("%s: session doesn't exist → inactive", shortName)
 		return "inactive", nil
 	}
 
-	// Capture current content (slow operation - do before lock)
+	// Get current activity timestamp (fast: ~4ms)
+	currentTS, err := s.GetWindowActivity()
+	if err != nil {
+		// Fallback to content-hash based detection
+		return s.getStatusFallback()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Skip expensive busy indicator check if no activity change and not in active state
+	// This is the key optimization: only call CapturePane() when activity detected
+	needsBusyCheck := false
+	if s.stateTracker != nil {
+		// Check busy indicator if:
+		// 1. timestamp changed (new activity)
+		// 2. we're in cooldown (might still be working)
+		// 3. we're in spike detection window (activity recently detected, waiting to confirm)
+		inSpikeWindow := !s.stateTracker.activityCheckStart.IsZero() &&
+			time.Since(s.stateTracker.activityCheckStart) < 1*time.Second
+		if s.stateTracker.lastActivityTimestamp != currentTS ||
+			time.Since(s.stateTracker.lastChangeTime) < activityCooldown ||
+			inSpikeWindow {
+			needsBusyCheck = true
+		}
+	} else {
+		// First call - check for busy indicator
+		needsBusyCheck = true
+	}
+
+	if needsBusyCheck {
+		// Release lock for slow CapturePane operation
+		s.mu.Unlock()
+		content, err := s.CapturePane()
+		s.mu.Lock()
+
+		if err == nil && s.hasBusyIndicator(content) {
+			s.ensureStateTrackerLocked()
+			s.stateTracker.lastChangeTime = time.Now()
+			s.stateTracker.acknowledged = false
+			s.stateTracker.lastActivityTimestamp = currentTS
+			s.lastStableStatus = "active"
+			debugLog("%s: BUSY INDICATOR → active", shortName)
+			return "active", nil
+		}
+	}
+
+	// Initialize on first call
+	if s.stateTracker == nil {
+		s.stateTracker = &StateTracker{
+			lastChangeTime:        time.Now().Add(-activityCooldown),
+			acknowledged:          true,
+			lastActivityTimestamp: currentTS,
+		}
+		s.lastStableStatus = "idle"
+		debugLog("%s: INIT → idle", shortName)
+		return "idle", nil
+	}
+
+	// Restored session (lastActivityTimestamp == 0)
+	if s.stateTracker.lastActivityTimestamp == 0 {
+		s.stateTracker.lastActivityTimestamp = currentTS
+		if s.stateTracker.acknowledged {
+			s.lastStableStatus = "idle"
+			return "idle", nil
+		}
+		s.lastStableStatus = "waiting"
+		return "waiting", nil
+	}
+
+	// Activity timestamp changed → non-blocking spike detection across tick cycles
+	if s.stateTracker.lastActivityTimestamp != currentTS {
+		oldTS := s.stateTracker.lastActivityTimestamp
+		s.stateTracker.lastActivityTimestamp = currentTS
+
+		// Check if we're in a detection window
+		const spikeWindow = 1 * time.Second
+		now := time.Now()
+
+		if s.stateTracker.activityCheckStart.IsZero() || now.Sub(s.stateTracker.activityCheckStart) > spikeWindow {
+			// Start new detection window
+			s.stateTracker.activityCheckStart = now
+			s.stateTracker.activityChangeCount = 1
+			debugLog("%s: ACTIVITY_START ts=%d→%d count=1", shortName, oldTS, currentTS)
+		} else {
+			// Within detection window - count this change
+			s.stateTracker.activityChangeCount++
+			debugLog("%s: ACTIVITY_COUNT ts=%d→%d count=%d", shortName, oldTS, currentTS, s.stateTracker.activityChangeCount)
+
+			// 2+ changes within 1 second = sustained activity
+			if s.stateTracker.activityChangeCount >= 2 {
+				s.stateTracker.lastChangeTime = now
+				s.stateTracker.acknowledged = false
+				s.stateTracker.activityCheckStart = time.Time{} // Reset window
+				s.stateTracker.activityChangeCount = 0
+				s.lastStableStatus = "active"
+				debugLog("%s: SUSTAINED count=%d → active", shortName, s.stateTracker.activityChangeCount)
+				return "active", nil
+			}
+		}
+		// Not enough changes yet - continue with current status (don't block)
+	} else {
+		// No timestamp change - check if spike window expired with only 1 change
+		if s.stateTracker.activityChangeCount == 1 && !s.stateTracker.activityCheckStart.IsZero() {
+			if time.Since(s.stateTracker.activityCheckStart) > 1*time.Second {
+				// Only 1 change in 1 second = spike, reset tracking
+				debugLog("%s: SPIKE_EXPIRED count=1 (filtered)", shortName)
+				s.stateTracker.activityCheckStart = time.Time{}
+				s.stateTracker.activityChangeCount = 0
+			}
+		}
+	}
+
+	// Stay GREEN during spike detection window to avoid yellow flicker
+	// When we see a timestamp change but haven't yet confirmed it's sustained (2+ changes),
+	// we should show GREEN, not fall through to the cooldown check which might return YELLOW
+	if !s.stateTracker.activityCheckStart.IsZero() &&
+		time.Since(s.stateTracker.activityCheckStart) < 1*time.Second {
+		s.lastStableStatus = "active"
+		debugLog("%s: SPIKE_WINDOW_ACTIVE → active (avoiding yellow flicker)", shortName)
+		return "active", nil
+	}
+
+	// Check cooldown
+	if time.Since(s.stateTracker.lastChangeTime) < activityCooldown {
+		s.lastStableStatus = "active"
+		return "active", nil
+	}
+
+	// Cooldown expired
+	if s.stateTracker.acknowledged {
+		s.lastStableStatus = "idle"
+		return "idle", nil
+	}
+	s.lastStableStatus = "waiting"
+	return "waiting", nil
+}
+
+// getStatusFallback uses content-hash based detection as fallback
+// when activity timestamp detection fails
+func (s *Session) getStatusFallback() (string, error) {
+	shortName := s.DisplayName
+	if len(shortName) > 12 {
+		shortName = shortName[:12]
+	}
+
 	content, err := s.CapturePane()
 	if err != nil {
 		s.mu.Lock()
 		s.lastStableStatus = "inactive"
 		s.mu.Unlock()
-		debugLog("%s: capture error → inactive", shortName)
 		return "inactive", nil
 	}
 
-	// === BUSY INDICATOR CHECK (before hash comparison) ===
-	// If Claude shows "esc to interrupt", spinners, or "Thinking..." - it's actively working
-	// This catches cases where normalized content hash doesn't change
-	// (e.g., "Thinking... (40s)" → "Thinking... (41s)" both normalize to same hash)
 	if s.hasBusyIndicator(content) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.ensureStateTrackerLocked()
-		s.stateTracker.lastChangeTime = time.Now() // Reset cooldown
+		s.stateTracker.lastChangeTime = time.Now()
 		s.stateTracker.acknowledged = false
 		s.lastStableStatus = "active"
-		debugLog("%s: BUSY INDICATOR → active", shortName)
 		return "active", nil
 	}
 
-	// Clean content: strip ANSI codes, spinner characters, normalize whitespace
 	cleanContent := s.normalizeContent(content)
 	currentHash := s.hashContent(cleanContent)
-
-	// Handle empty content - use placeholder hash to avoid edge cases
-	if currentHash == "" || cleanContent == "" {
+	if currentHash == "" {
 		currentHash = "__empty__"
 	}
 
-	// Now acquire lock for state manipulation
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Initialize state tracker on first call
-	// === SIMPLIFIED STATUS LOGIC ===
-	// 0. Busy indicator present → return "active" (GREEN) - handled above
-	// 1. New session (nil tracker) → init, return "idle" (GRAY) - no yellow flash
-	// 2. Restored session (empty hash) → set hash, return "idle" (GRAY) - no yellow flash
-	// 3. Content changed → return "active" (GREEN)
-	// 4. Content same, within cooldown → return "active" (GREEN)
-	// 5. Content same, cooldown expired → return based on acknowledged
-
-	// New session - first poll: start as IDLE (gray) to avoid yellow flash
-	// Busy indicator check above will catch actively running sessions
 	if s.stateTracker == nil {
 		s.stateTracker = &StateTracker{
 			lastHash:       currentHash,
-			lastChangeTime: time.Now().Add(-activityCooldown), // Pre-expired
-			acknowledged:   true,                              // Start idle (gray)
+			lastChangeTime: time.Now().Add(-activityCooldown),
+			acknowledged:   true,
 		}
 		s.lastStableStatus = "idle"
-		debugLog("%s: INIT → idle (no flash)", shortName)
 		return "idle", nil
 	}
 
-	// Restored session - set baseline hash, respect saved acknowledged state
-	// Busy indicator check above already catches actively running sessions
 	if s.stateTracker.lastHash == "" {
 		s.stateTracker.lastHash = currentHash
-		// Don't change acknowledged - respect value from ReconnectSessionWithStatus
 		if s.stateTracker.acknowledged {
 			s.lastStableStatus = "idle"
-			debugLog("%s: RESTORED ack=true → idle", shortName)
 			return "idle", nil
 		}
 		s.lastStableStatus = "waiting"
-		debugLog("%s: RESTORED ack=false → waiting", shortName)
 		return "waiting", nil
 	}
 
-	// Content changed → GREEN
 	if s.stateTracker.lastHash != currentHash {
 		s.stateTracker.lastHash = currentHash
 		s.stateTracker.lastChangeTime = time.Now()
 		s.stateTracker.acknowledged = false
 		s.lastStableStatus = "active"
-		debugLog("%s: CHANGED → active", shortName)
+		debugLog("%s: FALLBACK CHANGED → active", shortName)
 		return "active", nil
 	}
 
-	// Content same - check cooldown
 	if time.Since(s.stateTracker.lastChangeTime) < activityCooldown {
 		s.lastStableStatus = "active"
-		debugLog("%s: COOLDOWN → active", shortName)
 		return "active", nil
 	}
 
-	// Cooldown expired → YELLOW or GRAY
 	if s.stateTracker.acknowledged {
 		s.lastStableStatus = "idle"
-		debugLog("%s: IDLE → idle", shortName)
 		return "idle", nil
 	}
 	s.lastStableStatus = "waiting"
-	debugLog("%s: WAITING → waiting", shortName)
 	return "waiting", nil
 }
 
@@ -869,6 +1023,11 @@ func (s *Session) ResetAcknowledged() {
 // - Aider: Processing indicators
 // - Shell: Running commands (no prompt visible)
 func (s *Session) hasBusyIndicator(content string) bool {
+	shortName := s.DisplayName
+	if len(shortName) > 12 {
+		shortName = shortName[:12]
+	}
+
 	// Get last 10 lines for analysis
 	lines := strings.Split(content, "\n")
 	start := len(lines) - 10
@@ -888,17 +1047,20 @@ func (s *Session) hasBusyIndicator(content string) bool {
 
 	for _, indicator := range busyIndicators {
 		if strings.Contains(recentContent, indicator) {
+			debugLog("%s: BUSY_REASON=text_indicator matched=%q", shortName, indicator)
 			return true
 		}
 	}
 
 	// Check for "Thinking... (Xs · Y tokens)" pattern
 	if strings.Contains(recentContent, "thinking") && strings.Contains(recentContent, "tokens") {
+		debugLog("%s: BUSY_REASON=thinking+tokens pattern", shortName)
 		return true
 	}
 
 	// Check for "Connecting..." pattern
 	if strings.Contains(recentContent, "connecting") && strings.Contains(recentContent, "tokens") {
+		debugLog("%s: BUSY_REASON=connecting+tokens pattern", shortName)
 		return true
 	}
 
@@ -914,9 +1076,10 @@ func (s *Session) hasBusyIndicator(content string) bool {
 		last5 = last5[len(last5)-5:]
 	}
 
-	for _, line := range last5 {
+	for lineIdx, line := range last5 {
 		for _, spinner := range spinnerChars {
 			if strings.Contains(line, spinner) {
+				debugLog("%s: BUSY_REASON=spinner char=%q line=%d content=%q", shortName, spinner, lineIdx, truncateForLog(line, 50))
 				return true
 			}
 		}
@@ -937,15 +1100,62 @@ func (s *Session) hasBusyIndicator(content string) bool {
 	// Only match these if they're standalone (not part of other text)
 	for _, indicator := range workingIndicators {
 		// Check if indicator appears at start of a line (more reliable)
-		for _, line := range last5 {
+		for lineIdx, line := range last5 {
 			lineLower := strings.ToLower(strings.TrimSpace(line))
 			if strings.HasPrefix(lineLower, indicator) {
+				debugLog("%s: BUSY_REASON=working_indicator matched=%q line=%d content=%q", shortName, indicator, lineIdx, truncateForLog(line, 50))
 				return true
 			}
 		}
 	}
 
 	return false
+}
+
+// truncateForLog truncates a string for logging purposes
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// isSustainedActivity checks if activity is sustained (real work) or a spike.
+// Checks 5 times over 1 second, counts timestamp changes.
+// Returns true if 1+ changes detected AFTER initial check (sustained activity).
+// Returns false if no additional changes (spike - status bar update, etc).
+//
+// This filters out false positives from:
+// - Status bar time updates (e.g., Claude Code's auto-compact %)
+// - Single cursor movements
+// - Terminal refresh events
+func (s *Session) isSustainedActivity() bool {
+	const (
+		checkCount    = 5
+		checkInterval = 200 * time.Millisecond
+	)
+
+	prevTS, err := s.GetWindowActivity()
+	if err != nil {
+		return false
+	}
+
+	changes := 0
+	for i := 0; i < checkCount; i++ {
+		time.Sleep(checkInterval)
+		currentTS, err := s.GetWindowActivity()
+		if err != nil {
+			continue
+		}
+		if currentTS != prevTS {
+			changes++
+			prevTS = currentTS
+		}
+	}
+
+	isSustained := changes >= 1 // At least 1 MORE change after initial detection
+	debugLog("%s: isSustainedActivity changes=%d sustained=%v", s.DisplayName, changes, isSustained)
+	return isSustained
 }
 
 // Precompiled regex patterns for dynamic content stripping
