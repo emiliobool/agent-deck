@@ -89,3 +89,79 @@ func TestInstance_UpdateClaudeSession(t *testing.T) {
 	// After update with no Claude running, should have no session ID
 	// (In integration test, would verify actual detection)
 }
+
+// TestInstance_Fork tests the Fork method
+func TestInstance_Fork(t *testing.T) {
+	inst := NewInstance("test", "/tmp/test")
+
+	// Cannot fork without session ID
+	_, err := inst.Fork("forked-test", "")
+	if err == nil {
+		t.Error("Fork() should fail without ClaudeSessionID")
+	}
+
+	// With session ID, Fork returns command to run
+	inst.ClaudeSessionID = "abc-123"
+	inst.ClaudeDetectedAt = time.Now()
+	cmd, err := inst.Fork("forked-test", "")
+	if err != nil {
+		t.Errorf("Fork() failed: %v", err)
+	}
+
+	expected := "claude --resume abc-123 --fork-session"
+	if cmd != expected {
+		t.Errorf("Fork() = %s, want %s", cmd, expected)
+	}
+}
+
+// TestInstance_CreateForkedInstance tests the CreateForkedInstance method
+func TestInstance_CreateForkedInstance(t *testing.T) {
+	inst := NewInstance("original", "/tmp/test")
+	inst.GroupPath = "projects"
+
+	// Cannot create fork without session ID
+	_, _, err := inst.CreateForkedInstance("forked", "")
+	if err == nil {
+		t.Error("CreateForkedInstance() should fail without ClaudeSessionID")
+	}
+
+	// With session ID, creates new instance with fork command
+	inst.ClaudeSessionID = "abc-123"
+	inst.ClaudeDetectedAt = time.Now()
+	forked, cmd, err := inst.CreateForkedInstance("forked", "")
+	if err != nil {
+		t.Errorf("CreateForkedInstance() failed: %v", err)
+	}
+
+	// Verify command is correct
+	expectedCmd := "claude --resume abc-123 --fork-session"
+	if cmd != expectedCmd {
+		t.Errorf("Command = %s, want %s", cmd, expectedCmd)
+	}
+
+	// Verify forked instance has correct properties
+	if forked.Title != "forked" {
+		t.Errorf("Forked title = %s, want forked", forked.Title)
+	}
+	if forked.ProjectPath != "/tmp/test" {
+		t.Errorf("Forked path = %s, want /tmp/test", forked.ProjectPath)
+	}
+	if forked.GroupPath != "projects" {
+		t.Errorf("Forked group = %s, want projects (inherited)", forked.GroupPath)
+	}
+	if forked.Command != expectedCmd {
+		t.Errorf("Forked command = %s, want %s", forked.Command, expectedCmd)
+	}
+	if forked.Tool != "claude" {
+		t.Errorf("Forked tool = %s, want claude", forked.Tool)
+	}
+
+	// Test with custom group path
+	forked2, _, err := inst.CreateForkedInstance("forked2", "custom-group")
+	if err != nil {
+		t.Errorf("CreateForkedInstance() with custom group failed: %v", err)
+	}
+	if forked2.GroupPath != "custom-group" {
+		t.Errorf("Forked group = %s, want custom-group", forked2.GroupPath)
+	}
+}

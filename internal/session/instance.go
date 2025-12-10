@@ -259,6 +259,39 @@ func (i *Instance) CanFork() bool {
 	return time.Since(i.ClaudeDetectedAt) < 5*time.Minute
 }
 
+// Fork returns the command to create a forked Claude session
+// Returns the claude command string to run in the new tmux session
+func (i *Instance) Fork(newTitle, newGroupPath string) (string, error) {
+	if !i.CanFork() {
+		return "", fmt.Errorf("cannot fork: no active Claude session")
+	}
+
+	// Build the fork command
+	cmd := fmt.Sprintf("claude --resume %s --fork-session", i.ClaudeSessionID)
+
+	return cmd, nil
+}
+
+// CreateForkedInstance creates a new Instance configured for forking
+func (i *Instance) CreateForkedInstance(newTitle, newGroupPath string) (*Instance, string, error) {
+	cmd, err := i.Fork(newTitle, newGroupPath)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Create new instance
+	forked := NewInstance(newTitle, i.ProjectPath)
+	if newGroupPath != "" {
+		forked.GroupPath = newGroupPath
+	} else {
+		forked.GroupPath = i.GroupPath
+	}
+	forked.Command = cmd
+	forked.Tool = "claude"
+
+	return forked, cmd, nil
+}
+
 // Exists checks if the tmux session still exists
 func (i *Instance) Exists() bool {
 	if i.tmuxSession == nil {
