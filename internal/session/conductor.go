@@ -401,8 +401,18 @@ func LaunchdPlistPath() (string, error) {
 	return filepath.Join(homeDir, "Library", "LaunchAgents", LaunchdPlistName+".plist"), nil
 }
 
-// findPython3 looks for python3 in common locations
+// findPython3 looks for python3, preferring the conductor venv if it exists
 func findPython3() string {
+	// Prefer venv python (has aiogram/toml installed)
+	condDir, err := ConductorDir()
+	if err == nil {
+		venvPython := filepath.Join(condDir, "venv", "bin", "python3")
+		if _, err := os.Stat(venvPython); err == nil {
+			return venvPython
+		}
+	}
+
+	// Fall back to system python3
 	paths := []string{
 		"/opt/homebrew/bin/python3",
 		"/usr/local/bin/python3",

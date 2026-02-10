@@ -211,7 +211,7 @@ A thin bridge that:
 Discovers conductors dynamically from meta.json files in ~/.agent-deck/conductor/*/
 Each conductor has its own name, profile, and heartbeat settings.
 
-Dependencies: pip3 install aiogram toml
+Dependencies: managed via venv at ~/.agent-deck/conductor/venv/
 """
 
 import asyncio

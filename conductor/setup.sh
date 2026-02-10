@@ -48,12 +48,19 @@ ok "bridge.py installed"
 # Step 2: Install Python dependencies
 # --------------------------------------------------------------------------
 
-info "Installing Python dependencies..."
-python3 -m pip install --quiet --user aiogram toml 2>/dev/null || {
-    warn "pip install --user failed, trying without --user..."
-    python3 -m pip install --quiet aiogram toml 2>/dev/null || {
-        fail "Could not install Python dependencies (aiogram, toml). Install manually: pip3 install aiogram toml"
-    }
+VENV_DIR="${CONDUCTOR_DIR}/venv"
+
+info "Setting up Python virtual environment..."
+if [[ ! -f "${VENV_DIR}/bin/python3" ]]; then
+    python3 -m venv "${VENV_DIR}" || fail "Could not create venv at ${VENV_DIR}"
+    ok "Virtual environment created at ${VENV_DIR}"
+else
+    ok "Virtual environment already exists"
+fi
+
+info "Installing Python dependencies into venv..."
+"${VENV_DIR}/bin/pip" install --quiet aiogram toml || {
+    fail "Could not install Python dependencies. Run: ${VENV_DIR}/bin/pip install aiogram toml"
 }
 ok "Python dependencies installed (aiogram, toml)"
 
@@ -164,8 +171,8 @@ done
 info "Installing launchd daemon..."
 mkdir -p "${PLIST_DIR}"
 
-# Resolve python3 path for plist
-PYTHON3_PATH="$(command -v python3)"
+# Use venv python3 for plist (has aiogram/toml installed)
+PYTHON3_PATH="${VENV_DIR}/bin/python3"
 
 # Generate plist from template with variable substitution
 sed \

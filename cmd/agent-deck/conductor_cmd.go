@@ -513,6 +513,7 @@ func handleConductorTeardown(_ string, args []string) {
 			_ = os.Remove(filepath.Join(condDir, "bridge.py"))
 			_ = os.Remove(filepath.Join(condDir, "bridge.log"))
 			_ = os.Remove(filepath.Join(condDir, "CLAUDE.md"))
+			_ = os.RemoveAll(filepath.Join(condDir, "venv"))
 			_ = os.Remove(condDir) // Remove dir if empty
 		}
 	}
@@ -818,17 +819,32 @@ func handleConductorList(profile string, args []string) {
 	fmt.Println()
 }
 
-// installPythonDeps installs Python dependencies for the bridge
+// installPythonDeps creates a venv and installs Python dependencies for the bridge.
+// Uses a virtual environment to avoid issues with externally-managed Python (PEP 668).
 func installPythonDeps() {
-	// Try pip install --user first
-	cmd := exec.Command("python3", "-m", "pip", "install", "--quiet", "--user", "aiogram", "toml")
-	if err := cmd.Run(); err != nil {
-		// Try without --user
-		cmd = exec.Command("python3", "-m", "pip", "install", "--quiet", "aiogram", "toml")
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintln(os.Stderr, "Warning: could not install Python dependencies (aiogram, toml)")
-			fmt.Fprintln(os.Stderr, "Install manually: pip3 install aiogram toml")
+	condDir, err := session.ConductorDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Warning: could not determine conductor directory")
+		return
+	}
+	venvPath := filepath.Join(condDir, "venv")
+
+	// Create venv if it doesn't exist
+	if _, err := os.Stat(filepath.Join(venvPath, "bin", "python3")); os.IsNotExist(err) {
+		cmd := exec.Command("python3", "-m", "venv", venvPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not create venv at %s: %v\n%s\n", venvPath, err, string(out))
+			fmt.Fprintln(os.Stderr, "Install manually: python3 -m venv ~/.agent-deck/conductor/venv && ~/.agent-deck/conductor/venv/bin/pip install aiogram toml")
+			return
 		}
+	}
+
+	// Install deps into venv
+	pip := filepath.Join(venvPath, "bin", "pip")
+	cmd := exec.Command(pip, "install", "--quiet", "aiogram", "toml")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not install Python dependencies: %v\n%s\n", err, string(out))
+		fmt.Fprintf(os.Stderr, "Install manually: %s install aiogram toml\n", pip)
 	}
 }
 

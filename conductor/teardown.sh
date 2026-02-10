@@ -81,6 +81,11 @@ if [[ "${REMOVE_DIR}" =~ ^[Yy] ]]; then
     done
     # Remove bridge.py and bridge.log from base conductor dir
     rm -f "${CONDUCTOR_DIR}/bridge.py" "${CONDUCTOR_DIR}/bridge.log"
+    # Remove Python virtual environment
+    if [[ -d "${CONDUCTOR_DIR}/venv" ]]; then
+        rm -rf "${CONDUCTOR_DIR}/venv"
+        ok "Removed virtual environment"
+    fi
     # Remove conductor dir if empty
     rmdir "${CONDUCTOR_DIR}" 2>/dev/null && ok "Removed empty ${CONDUCTOR_DIR}" || true
 else

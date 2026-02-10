@@ -10,7 +10,7 @@ A thin bridge that:
 Supports multiple profiles: each profile gets its own conductor session.
 The bridge aggregates status across all profiles.
 
-Dependencies: pip3 install aiogram toml
+Dependencies: managed via venv at ~/.agent-deck/conductor/venv/
 """
 
 import asyncio
